@@ -4,6 +4,8 @@ import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import Dataset, DataLoader, random_split, SubsetRandomSampler
+from torch.cuda.amp import autocast, GradScaler
+
 
 import test  # import test.py to get mAP after each epoch
 from models import *
@@ -11,9 +13,30 @@ from mymodel import *
 
 from utils.datasets import *
 from utils.utils import *
+import torch, time, gc
+
+
+#Time and memory count
+start_time = None
+
+def start_timer():
+    global start_time
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_max_memory_allocated()
+    torch.cuda.synchronize()
+    start_time = time.time()
+
+def end_timer_and_print(local_msg):
+    torch.cuda.synchronize()
+    end_time = time.time()
+    print("\n" + local_msg)
+    print("Total execution time = {:.3f} sec".format(end_time - start_time))
+    print("Max memory used by tensors = {} bytes".format(torch.cuda.max_memory_allocated()))
 
 
 def train():
+    start_timer()
     cfg = opt.cfg
     data = opt.data
     img_size, img_size_test = opt.img_size if len(opt.img_size) == 2 else opt.img_size * 2  # train, test sizes
@@ -23,6 +46,8 @@ def train():
     batch_size = opt.batch_size
     accumulate = opt.accumulate  # effective bs = batch_size * accumulate = 16 * 4 = 64
     weights = opt.weights  # initial training weights
+    scaler = GradScaler() # handles scaling of the loss to prevent underflow during backpropagation when using mixed precision
+
 
     # Initialize
     init_seeds()
@@ -95,8 +120,7 @@ def train():
         load_darknet_weights(model, weights)
 
     # Scheduler https://github.com/ultralytics/yolov3/issues/238
-    lf = lambda x: (1 + math.cos(x * math.pi / epochs)) / 2 * 0.99 + 0.01  # cosine https://arxiv.org/pdf/1812.01187.pdf
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda= lambda x: (1 + math.cos(x * math.pi / epochs)) / 2 * 0.99 + 0.01)
     # scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[round(epochs * x) for x in [0.8, 0.9]], gamma=0.1)
     scheduler.last_epoch = start_epoch
 
@@ -194,27 +218,24 @@ def train():
                     ns = [math.ceil(x * sf / 32.) * 32 for x in imgs.shape[2:]]  # new shape (stretched to 16-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Run model
-            pred = model(imgs)
 
-            # Compute loss
-            loss, loss_items = compute_loss(pred, targets, model)
+            # Forward pass and loss computation with autocast
+            with autocast():
+                pred = model(imgs)
+                loss, loss_items = compute_loss(pred, targets, model)
+                
             if not torch.isfinite(loss):
                 print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
 
-            # Scale loss by nominal batch_size of 64
-            loss *= batch_size / 64
-
-
-            loss.backward()
+            # Scale loss and backward pass with AMP
+            scaler.scale(loss).backward()
 
             # Optimize accumulated gradient
             if ni % accumulate == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
-                # break
-
             # Print batch results
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
             mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
@@ -316,7 +337,8 @@ def train():
     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
     dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
     torch.cuda.empty_cache()
-
+    local_msg = "training done."
+    end_timer_and_print(local_msg)
     return results
 
 
