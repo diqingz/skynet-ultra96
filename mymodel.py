@@ -21,20 +21,21 @@ import os
 #         return self.lambd(x)
 
 def create_grids(self, img_size=416, ng=(13, 13), device='cpu', type=torch.float32):
-    nx, ny = ng  # x and y grid size
-    self.img_size = max(img_size)
-    self.stride = self.img_size / max(ng)
+    if self.grid_xy is None or self.grid.shape[2:4] != ng:
+        nx, ny = ng  # x and y grid size
+        self.img_size = max(img_size)
+        self.stride = self.img_size / max(ng)
 
-    # build xy offsets
-    yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-    self.grid_xy = torch.stack((xv, yv), 2).to(device).type(type).view((1, 1, ny, nx, 2))
+        # build xy offsets
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        self.grid_xy = torch.stack((xv, yv), 2).to(device).type(type).view((1, 1, ny, nx, 2))
 
-    # build wh gains
-    self.anchor_vec = self.anchors.to(device) / self.stride
-    self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2).to(device).type(type)
-    self.ng = torch.Tensor(ng).to(device)
-    self.nx = nx
-    self.ny = ny
+        # build wh gains
+        self.anchor_vec = self.anchors.to(device) / self.stride
+        self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2).to(device).type(type)
+        self.ng = torch.Tensor(ng).to(device)
+        self.nx = nx
+        self.ny = ny
 
 class YOLOLayer(nn.Module):
     def __init__(self, anchors):
